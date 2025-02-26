@@ -5,26 +5,20 @@ using Lean.Pool;
 using Unity.VisualScripting;
 using UnityEngine.UI;
 using System.Drawing;
+using Unity.Burst.Intrinsics;
+using System.Linq;
 
 public class GridManager : MonoBehaviour
 {
     [SerializeField] public Vector2Int GridSize;
-    private Vector2 _offset => new(GridSize.x/2f, GridSize.y/2f); 
     [SerializeField] float CellSize;
     [SerializeField] Transform _Anchor;
-
     [SerializeField] Cell prefab_Cell;
-
-    public Dictionary<Vector2Int, Cell> CellDict = new();
-
     [SerializeField] Piece[] prefab_Pieces;
 
-    public Dictionary<Piece, (List<Vector2Int> moveCells, List<Vector2Int> attackCells)> PieceList = new Dictionary<Piece, (List<Vector2Int>, List<Vector2Int>)>();
 
-
-    /// <summary>
-    /// Input Juggling
-    /// </summary>
+    public Dictionary<Vector2Int, Cell> CellDict = new();
+    public List<Piece> PieceList = new();
 
     public enum Directions
     {
@@ -61,11 +55,8 @@ public class GridManager : MonoBehaviour
 
     public void NewTurn()
     {
-        foreach(var key in PieceList.Keys)
-        {
-            PieceList[key].moveCells.Clear();
-            PieceList[key].attackCells.Clear();
-        }
+        foreach (var piece in PieceList)
+            piece.ResetMovesets();
     }
 
     private void GenerateGrid()
@@ -87,23 +78,17 @@ public class GridManager : MonoBehaviour
         } 
         foreach(var kvp in CellDict)
         {
-            kvp.Value.Init(kvp.Key, this);
+            kvp.Value.Init(kvp.Key);
         }
     }
 
     private void GeneratePieces()
     {
         //We don't know which ones have been used, so clear the board befor respawning all of them.
-
-        if(PieceList.Count != 0)
+        for (int i = PieceList.Count - 1; i >= 0; i--)
         {
-            foreach(var piece in PieceList)
-            {
-                LeanPool.Despawn(piece.Key);
-            }
-            PieceList.Clear();
+            DespawnPiece(PieceList[i]); //Removed entries from piecelist, so we use a reverse for
         }
-
 
         for(int y = 0;y< GridSize.y; y++)
         {
@@ -133,13 +118,22 @@ public class GridManager : MonoBehaviour
                 }
                 if (piece != null)
                 {
-                    PieceList.Add(piece, (new List<Vector2Int>(), new List<Vector2Int>()));
-                    GetCell(new Vector2Int(x, y)).SetPiece(piece);
+                    PieceList.Add(piece);
+                    GetCell(coord).SetPiece(piece);
                 }
             }
         }    
     }
-    
+
+    public void DespawnPiece(Piece piece)
+    {
+        if (piece == null) return; //throw a theoretical exception here
+        GetCell(piece.Position).SetPiece(null);
+        if(PieceList.Contains(piece))
+            PieceList.Remove(piece);
+
+        LeanPool.Despawn(piece);
+    }
     public Cell GetCell(Vector2Int coord) => CellDict.TryGetValue(coord, out Cell cell) ? cell : null;
 
     public Cell GetCellFromScreenPoint(Vector3 point)
@@ -154,76 +148,69 @@ public class GridManager : MonoBehaviour
 
     public void CalculatePieceMovement(Piece piece)
     {
-        var validCells = GetValidDirectionalCells(piece);
-        ShowPieceMovment(validCells);
+        GetValidDirectionalCells(piece);
+        ShowPieceMovment(piece);
     }
 
-    public void ShowPieceMovment((List<Vector2Int> moveCells, List<Vector2Int> attackCells) validCells)
+    public void ShowPieceMovment(Piece piece)
     {
-        foreach (var moveCell in validCells.moveCells)
+        foreach (var moveCell in piece.GetMoves())
             GetCell(moveCell).SetVisualState(Cell.VisualState.ValidMove);
 
-        Debug.Log($"attackcells {validCells.attackCells.Count}");
-        foreach (var attackCell in validCells.attackCells)
+        foreach (var attackCell in piece.GetAttacks())
             GetCell(attackCell).SetVisualState(Cell.VisualState.ValidAttack);
-
     }
 
     public void ClearCellVisuals()
     {
         foreach (var cell in CellDict.Values)
-        {
             cell.SetVisualState(Cell.VisualState.None);
-        }
     }
 
-    public (List<Vector2Int> moveCells, List<Vector2Int> attackCells) GetValidDirectionalCells(Piece piece)
+    public void GetValidDirectionalCells(Piece piece)
     {
-        List<Vector2Int> moveCells = new();
-        List<Vector2Int> attackCells = new();
+        //if (!piece.Clean)
+        //    return;
 
-        bool moveAttackOverlap = piece.ValidMove == piece.ValidAttack;
-        foreach(var dir in piece.ValidMove)
+        //Note that the break delegates always fail if the piece is marked continuous, forcing a search range of 1.
+        validCell moveCellEval = (cell) => (cell.CurrentPiece == null); //Include empty cells
+        shouldBreak moveBreakEval = (cell) => (!piece.Continuous || !moveCellEval(cell)); //break as soon as we fail
+        List<Vector2Int> moveCells = EvaluateDirectionSet(piece.Position, piece.MoveOptions, moveCellEval, moveBreakEval);
+
+        validCell attackCellEval = (cell) => (cell.CurrentPiece != null && cell.CurrentPiece.PieceColor == piece.PieceColor.Opposite()); //include non-empty cells with enemies
+        shouldBreak attackBreakEval = (cell) => (!piece.Continuous || cell.CurrentPiece!=null); //break after finding any non-empty cell
+        List<Vector2Int> attackCells = EvaluateDirectionSet(piece.Position, piece.AttackOptions, attackCellEval, attackBreakEval);
+
+        piece.SetMovesets(moveCells, attackCells);
+    }
+
+    public delegate bool validCell(Cell cell);
+    public delegate bool shouldBreak(Cell cell);
+
+    /// <summary>
+    /// This is a genericized method for evaluation a direction set and applying the provided evaluation delegate, and then continuing or stopping based on the break delegate.
+    /// </summary>
+    /// <param name="evaluateCell">Takes the cell, evaluates if it should be added to the result.</param>
+    /// <param name="shouldBreak">Takes a cell, evaluates if we should stop searching in the current direction</param>
+    /// <returns></returns>
+    private List<Vector2Int> EvaluateDirectionSet(Vector2Int origin, List<Vector2Int> optionSet, validCell evaluateCell, shouldBreak shouldBreak)
+    {
+        List<Vector2Int> result = new List<Vector2Int>();
+        foreach (var dir in optionSet)
         {
-            Debug.Log($"Direction: {dir.ToString()}");
-            //Flip the direction. This should works for all directional pieces.
-            Vector2Int direction = DirectionMap[(int)dir] * (piece.PieceColor == GameManager.ChessColor.Black ? -1 : 1);
-            bool valid = true;
-            for(int i =1; valid; i++)
+            for (int i = 1; true; i++)
             {
-                valid = piece.Continuous; //instantly back out if we are using a non-"directional" piece (aka a pawn)
-                Vector2Int testPos = piece.Position + (i * direction);
+                Vector2Int testPos = origin + (i * dir);
                 Cell cell = GetCell(testPos);
                 if (cell != null)
                 {
-                    if (cell.CurrentPiece == null)
-                    {
-                        moveCells.Add(testPos);
-                    }
-                    else 
-                    {
-                        valid = false;
-                        if (piece.ValidAttack.Contains(dir) && cell.CurrentPiece.PieceColor == piece.PieceColor.Opposite()) //This is the first step of making this dynamically evaluate attack/move sets, but isn't *actually* needed until we don't hardcode the pawn behavior below
-                            attackCells.Add(testPos);
-                    }
+                    if (evaluateCell(cell)) result.Add(testPos);
+                    if (shouldBreak(cell)) break;
                 }
-                   
                 else break;
             }
         }
-        if (piece.PieceID == Piece.ID.Pawn) //This is simpler/cheaper than seeing if the attack & move set differ, but should be expanded if we add new movement/attack patterns
-        {
-            foreach (var dir in piece.ValidAttack)
-            {
-                Vector2Int testPos = piece.Position + DirectionMap[(int)dir] * (piece.PieceColor == GameManager.ChessColor.Black ? -1 : 1);
-                Cell cell = GetCell(testPos);
-                if(cell!=null && cell.CurrentPiece != null && cell.CurrentPiece.PieceColor == piece.PieceColor.Opposite())
-                    attackCells.Add(testPos);
-            }
-        }
-        PieceList[piece] = (moveCells, attackCells);
-        return (moveCells, attackCells);
-
+        return result;
     }
 }
 

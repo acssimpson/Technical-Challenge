@@ -53,7 +53,6 @@ public class GameManager : MonoBehaviour
                 mouseFollow.gameObject.SetActive(true);
                 mouseFollow.sprite = currentDragPiece.SpriteRenderer.sprite;
                 mouseFollow.color = currentDragPiece.SpriteRenderer.color;
-                Debug.Log($"Start drag {currentDragPiece.PieceID.ToString()}");
             }
         }
         if (Input.GetMouseButtonUp(0))
@@ -63,17 +62,19 @@ public class GameManager : MonoBehaviour
                 var dragoverCell = _GridManager.GetCellFromScreenPoint(Input.mousePosition);
                 if (dragoverCell != null)
                 {
-                    if (_GridManager.PieceList[currentDragPiece].moveCells.Contains(dragoverCell.Coords) || _GridManager.PieceList[currentDragPiece].attackCells.Contains(dragoverCell.Coords))
+                    if (currentDragPiece.GetMoves().Contains(dragoverCell.Coords) || currentDragPiece.GetAttacks().Contains(dragoverCell.Coords))
                     {
                         _GridManager.GetCell(currentDragPiece.Position).SetPiece(null);
+                        var oldPiece = dragoverCell.CurrentPiece;
                         dragoverCell.SetPiece(currentDragPiece);
+                        if(oldPiece != null) _GridManager.DespawnPiece(oldPiece);
                         ProgressTurn();
                     }
                 }
-                currentDragPiece = null;
+                currentDragPiece = null; //Kill mousefollow regardless.
                 mouseFollow.gameObject.SetActive(false);
                 _GridManager.ClearCellVisuals();
-            //Kill mousefollow regardless.
+            
             }
         }
     }
@@ -81,26 +82,22 @@ public class GameManager : MonoBehaviour
     private void SetPlayerTurn(ChessColor color)
     {
         ActivePlayer = color;
-        TurnText.text = $"{ActivePlayer.ToString()}'S TURN";
+        TurnText.text = $"{ActivePlayer}'S TURN";
     }
     public void ProgressTurn()
-    {
-        var max = (int)ChessColor.Black * (_GridManager.GridSize.y - 1);
-        SetPlayerTurn(ActivePlayer.Opposite());
-        foreach(var piece in _GridManager.PieceList.Keys)
+    {      
+        SetPlayerTurn(ActivePlayer.Opposite());   //Change Player
+        foreach (var piece in _GridManager.PieceList)
         {
             if(piece.Position.y == ((int)piece.PieceColor.Opposite()) * (_GridManager.GridSize.y-1))
             {
-
                 VictoryText.text = $"VICTORY FOR {piece.PieceColor}";
                 VictoryBanner.SetActive(true);
                 won = true;
                 break;
             }
+            piece.ResetMovesets(); //Reset move calculations
         }
-        //Change Player
-        //Reset move calculations
-
     }
 }
 
